@@ -1,0 +1,249 @@
+name: Build and publish Openship images
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild the latest stable upstream release
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: openship-image-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPOSITORY: oblien/openship
+  DOCKERHUB_NAMESPACE: czyt
+
+jobs:
+  check:
+    name: Check latest upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.release.outputs.skip }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      major: ${{ steps.release.outputs.major }}
+      major_minor: ${{ steps.release.outputs.major_minor }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+    steps:
+      - name: Checkout image repository
+        uses: actions/checkout@v7
+
+      - name: Resolve latest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream stable tag: ${tag}" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          major="${version%%.*}"
+          remainder="${version#*.}"
+          minor="${remainder%%.*}"
+          major_minor="${major}.${minor}"
+          source_sha="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${tag}" --jq '.sha')"
+          recorded="$(tr -d '[:space:]' < UPSTREAM_VERSION 2>/dev/null || true)"
+
+          skip=false
+          if [[ "${recorded}" == "${tag}" && "${FORCE_REBUILD}" != "true" ]]; then
+            skip=true
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "major=${major}"
+            echo "major_minor=${major_minor}"
+            echo "source_sha=${source_sha}"
+            echo "skip=${skip}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Openship upstream check"
+            echo
+            echo "- Latest stable release: \`${tag}\`"
+            echo "- Source commit: \`${source_sha}\`"
+            echo "- Recorded release: \`${recorded:-none}\`"
+            echo "- Build required: \`$([[ "${skip}" == "true" ]] && echo no || echo yes)\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build ${{ matrix.component }} image
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: API
+            dockerfile: apps/api/Dockerfile
+            image: openship-api
+          - component: Dashboard
+            dockerfile: apps/dashboard/Dockerfile
+            image: openship-dashboard
+          - component: Web
+            dockerfile: apps/web/Dockerfile
+            image: openship
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: oblien/openship
+          ref: ${{ needs.check.outputs.tag }}
+          path: source
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: needs.check.outputs.skip != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        if: needs.check.outputs.skip != 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.image }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ needs.check.outputs.version }}
+            type=raw,value=${{ needs.check.outputs.major_minor }}
+            type=raw,value=${{ needs.check.outputs.major }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Openship ${{ matrix.component }}
+            org.opencontainers.image.description=${{ matrix.component }} image for Openship
+            org.opencontainers.image.source=https://github.com/oblien/openship
+            org.opencontainers.image.revision=${{ needs.check.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=openship-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=openship-${{ matrix.image }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Make the GHCR package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_NAME: ${{ matrix.image }}
+        shell: bash
+        run: |
+          gh api --method PATCH \
+            "orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}" \
+            -f visibility=public
+
+  record-success:
+    name: Record successful image update
+    needs: [check, build]
+    if: always() && needs.check.outputs.skip != 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout image repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Update version and success files
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SOURCE_SHA: ${{ needs.check.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "${TAG}" > UPSTREAM_VERSION
+          sed -i -E "s/(OPENSHIP_VERSION:-)[^}]+/\1${VERSION}/g" docker-compose.yml
+          sed -i -E "s/^OPENSHIP_VERSION=.*/OPENSHIP_VERSION=${VERSION}/" .env.example
+          {
+            printf 'upstream_tag=%s\n' "${TAG}"
+            printf 'upstream_sha=%s\n' "${SOURCE_SHA}"
+            printf 'built_at=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > LAST_SUCCESSFUL_BUILD
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add UPSTREAM_VERSION LAST_SUCCESSFUL_BUILD docker-compose.yml .env.example
+
+          if git diff --cached --quiet; then
+            echo "No repository state changed."
+            exit 0
+          fi
+
+          git commit -m "chore: record Openship ${TAG} image build [skip ci]"
+          git push
+
+  keepalive:
+    name: Keep scheduled workflow active
+    needs: check
+    if: needs.check.outputs.skip == 'true' && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout image repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Refresh activity after 45 quiet days
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          now="$(date +%s)"
+          last_commit="$(git log -1 --format=%ct)"
+          age_days="$(( (now - last_commit) / 86400 ))"
+          if (( age_days < 45 )); then
+            echo "Last repository activity was ${age_days} days ago; no keepalive commit needed."
+            exit 0
+          fi
+
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .github/KEEPALIVE
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/KEEPALIVE
+          git commit -m "chore: keep scheduled image sync active [skip ci]"
+          git push
