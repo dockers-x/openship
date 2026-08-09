@@ -35,7 +35,7 @@ services:
       retries: 12
 
   api:
-    image: ${OPENSHIP_IMAGE_PREFIX:-czyt}/openship-api:${OPENSHIP_VERSION:-0.5.0}
+    image: ${OPENSHIP_IMAGE_PREFIX:-czyt}/openship-api:${OPENSHIP_VERSION:-0.6.1}
     restart: unless-stopped
     ports:
       - "4000:4000"
@@ -59,7 +59,7 @@ services:
       start_period: 40s
 
   dashboard:
-    image: ${OPENSHIP_IMAGE_PREFIX:-czyt}/openship-dashboard:${OPENSHIP_VERSION:-0.5.0}
+    image: ${OPENSHIP_IMAGE_PREFIX:-czyt}/openship-dashboard:${OPENSHIP_VERSION:-0.6.1}
     restart: unless-stopped
     ports:
       - "3001:3001"
@@ -74,7 +74,7 @@ services:
         condition: service_healthy
 
   web:
-    image: ${OPENSHIP_IMAGE_PREFIX:-czyt}/openship:${OPENSHIP_VERSION:-0.5.0}
+    image: ${OPENSHIP_IMAGE_PREFIX:-czyt}/openship:${OPENSHIP_VERSION:-0.6.1}
     restart: unless-stopped
     ports:
       - "3000:3000"
